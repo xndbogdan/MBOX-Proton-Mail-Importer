@@ -13,7 +13,7 @@ import time
 import tkinter as tk
 from datetime import datetime
 from email.mime.text import MIMEText
-from email.utils import mktime_tz, parsedate_tz
+from email.utils import formataddr, mktime_tz, parseaddr, parsedate_tz
 from tkinter import filedialog, messagebox, ttk
 import imaplib
 
@@ -135,11 +135,29 @@ def _parse_msg(raw_bytes):
         return None
 
 
+_ADDRESS_HEADERS = {"From", "To", "Cc"}
+
+
+def _safe_address(val):
+    """Return a properly formatted address, or placeholder if unparseable."""
+    if not val:
+        return "unknown@unknown.com"
+    try:
+        name, addr = parseaddr(val)
+        if addr and "@" in addr:
+            return formataddr((name, addr))
+    except Exception:
+        pass
+    return "unknown@unknown.com"
+
+
 def _copy_headers(src, dst):
-    """Copy safe headers from src message to dst message."""
+    """Copy safe headers from src to dst, sanitizing address headers."""
     for hdr in _SAFE_HEADERS:
         val = src.get(hdr)
         if val:
+            if hdr in _ADDRESS_HEADERS:
+                val = _safe_address(val)
             dst[hdr] = val
 
 
@@ -175,33 +193,26 @@ def _step_reserialize(raw_bytes):
 
 
 def _step_fix_headers(raw_bytes):
-    """Step 2: Fix corrupted sender/recipient/date headers."""
+    """Step 2: Sanitize all address and date headers.
+
+    Always replaces From/To/Cc with properly formatted versions —
+    Proton Bridge is stricter than Python's parser about RFC 5322.
+    """
     msg = _parse_msg(raw_bytes)
     if msg is None:
         return None
     try:
-        changed = False
-        # Fix From
-        from_val = msg.get("From", "")
-        if not from_val or "@" not in from_val:
-            del msg["From"]
-            msg["From"] = "unknown@unknown.com"
-            changed = True
-        # Fix To
-        to_val = msg.get("To", "")
-        if not to_val or "@" not in to_val:
-            del msg["To"]
-            msg["To"] = "unknown@unknown.com"
-            changed = True
+        for hdr in ("From", "To", "Cc"):
+            val = msg.get(hdr, "")
+            fixed = _safe_address(val) if val else None
+            if val:
+                del msg[hdr]
+                msg[hdr] = fixed
         # Fix Date
         date_val = msg.get("Date", "")
         if not date_val or parsedate_tz(date_val) is None:
             del msg["Date"]
-            msg["Date"] = datetime.now().strftime("%a, %d %b %Y %H:%M:%S %z") or \
-                          "Sat, 01 Jan 2000 00:00:00 +0000"
-            changed = True
-        if not changed:
-            return None  # headers were fine, skip this step
+            msg["Date"] = "Sat, 01 Jan 2000 00:00:00 +0000"
         return msg.as_bytes()
     except Exception:
         return None
@@ -375,6 +386,43 @@ class MboxImporter(threading.Thread):
             "retryable": retryable,
         }
 
+    def _try_append(self, message_bytes, flags, date):
+        """Attempt IMAP APPEND with one reconnect on connection error.
+
+        Returns True on success, False on message rejection.
+        Raises Exception on unrecoverable connection failure.
+        """
+        try:
+            self.imap.append_message(self.target_folder, flags, date, message_bytes)
+            return True
+        except MessageRejected:
+            return False
+        except Exception:
+            # Connection error — reconnect and retry once
+            self.imap.reconnect()
+            try:
+                self.imap.append_message(self.target_folder, flags, date, message_bytes)
+                return True
+            except MessageRejected:
+                return False
+            # Other exceptions propagate up (connection truly dead)
+
+    def _try_append_with_fixups(self, raw, flags, date):
+        """Try original message, then each fix-up step if rejected.
+
+        Returns True if any version was accepted.
+        Raises Exception on unrecoverable connection failure.
+        """
+        if self._try_append(raw, flags, date):
+            return True
+        for _step_name, step_fn in RETRY_STEPS:
+            fixed = step_fn(raw)
+            if fixed is None or len(fixed) > MAX_MESSAGE_SIZE:
+                continue
+            if self._try_append(fixed, flags, date):
+                return True
+        return False
+
     def run(self):
         mbox = mailbox.mbox(self.mbox_path)
         skipped = []
@@ -415,30 +463,20 @@ class MboxImporter(threading.Thread):
                 flags = self._mbox_flags_to_imap(message)
                 date = self._parse_date(message)
 
-                # Attempt APPEND — skip rejected messages, retry on connection failure
+                # Try original message, then fix-up pipeline if rejected
                 try:
-                    self.imap.append_message(self.target_folder, flags, date, raw)
-                except MessageRejected as e:
-                    entry = self._skip_entry(idx, message, "rejected", str(e))
-                    skipped.append(entry)
-                    SkippedStore.add_entry(self.mbox_path, fingerprint,
-                                          self.target_folder, entry)
-                    self.q.put(("progress", idx, self.total_messages, len(skipped)))
-                    continue
-                except Exception:
-                    try:
-                        self.imap.reconnect()
-                        self.imap.append_message(self.target_folder, flags, date, raw)
-                    except MessageRejected as e:
-                        entry = self._skip_entry(idx, message, "rejected", str(e))
+                    if not self._try_append_with_fixups(raw, flags, date):
+                        entry = self._skip_entry(idx, message, "rejected",
+                                                 "All fix-up steps failed",
+                                                 retryable=False)
                         skipped.append(entry)
                         SkippedStore.add_entry(self.mbox_path, fingerprint,
                                               self.target_folder, entry)
                         self.q.put(("progress", idx, self.total_messages, len(skipped)))
                         continue
-                    except Exception as e:
-                        self.q.put(("error", f"Connection lost at message {idx + 1}: {e}"))
-                        return
+                except Exception as e:
+                    self.q.put(("error", f"Connection lost at message {idx + 1}: {e}"))
+                    return
 
                 imported += 1
 

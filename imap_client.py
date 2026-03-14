@@ -97,13 +97,16 @@ class BridgeIMAP:
         literal = _CRLF_RE.sub(b'\r\n', message_bytes)
         # Set literal for _command to pick up, then issue the command
         self._conn.literal = literal
-        status, resp = self._conn._simple_command(
-            'APPEND', quoted_folder, flags, date_str
-        )
-        if status == "NO":
-            raise MessageRejected(f"Server rejected message: {resp}")
+        try:
+            status, resp = self._conn._simple_command(
+                'APPEND', quoted_folder, flags, date_str
+            )
+        except self._conn.error as e:
+            # BAD responses (e.g. invalid RFC5322) are raised by imaplib
+            # before we can check status — treat as message rejection
+            raise MessageRejected(str(e)) from e
         if status != "OK":
-            raise RuntimeError(f"APPEND failed: {status} {resp}")
+            raise MessageRejected(f"APPEND {status}: {resp}")
 
     def disconnect(self):
         """Logout and close the connection."""
