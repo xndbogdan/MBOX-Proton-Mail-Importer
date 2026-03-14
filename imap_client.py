@@ -7,6 +7,11 @@ import ssl
 _CRLF_RE = re.compile(br'\r\n|\r|\n')
 
 
+class MessageRejected(Exception):
+    """Server rejected the message (NO response) — not a connection error."""
+    pass
+
+
 class BridgeIMAP:
     """Manages IMAP connection to Proton Mail Bridge's local interface."""
 
@@ -95,6 +100,8 @@ class BridgeIMAP:
         status, resp = self._conn._simple_command(
             'APPEND', quoted_folder, flags, date_str
         )
+        if status == "NO":
+            raise MessageRejected(f"Server rejected message: {resp}")
         if status != "OK":
             raise RuntimeError(f"APPEND failed: {status} {resp}")
 

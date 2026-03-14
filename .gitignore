@@ -1,4 +1,6 @@
 credentials.json
 lastState.json
 lastState.json.tmp
+skipped.json
+skipped.json.tmp
 __pycache__/

@@ -4,13 +4,14 @@
 GUI utility (Python/tkinter) to import MBOX email archives into Proton Mail via Proton Mail Bridge's local IMAP interface. Supports resume on failure.
 
 ## Structure
-- `importer.py` — Main app: GUI (`App`), background import thread (`MboxImporter`), resume tracking (`ImportState`)
+- `importer.py` — Main app: GUI (`App`), import thread (`MboxImporter`), retry thread (`SkippedRetryImporter`), resume tracking (`ImportState`), skip tracking (`SkippedStore`)
 - `imap_client.py` — IMAP connection wrapper (`BridgeIMAP`) for Proton Bridge
 - `requirements.txt` — Single dependency: `tkinterdnd2` (drag & drop, optional)
 
 ## Runtime files (auto-created in app directory, gitignored)
 - `credentials.json` — Saved IMAP connection settings
 - `lastState.json` — Import progress for resume capability
+- `skipped.json` — Skipped message details with retry support
 
 ## Commands
 - Run: `python importer.py`

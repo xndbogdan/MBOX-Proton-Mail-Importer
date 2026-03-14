@@ -1,5 +1,7 @@
 """MBOX to Proton Mail Bridge Importer — GUI application."""
 
+import email
+import email.policy
 import hashlib
 import json
 import mailbox
@@ -10,11 +12,12 @@ import threading
 import time
 import tkinter as tk
 from datetime import datetime
+from email.mime.text import MIMEText
 from email.utils import mktime_tz, parsedate_tz
 from tkinter import filedialog, messagebox, ttk
 import imaplib
 
-from imap_client import BridgeIMAP
+from imap_client import BridgeIMAP, MessageRejected
 
 # Allow large IMAP response lines (some emails are huge)
 imaplib._MAXLINE = 10_000_000
@@ -22,6 +25,7 @@ imaplib._MAXLINE = 10_000_000
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 CREDENTIALS_FILE = os.path.join(APP_DIR, "credentials.json")
 STATE_FILE = os.path.join(APP_DIR, "lastState.json")
+SKIPPED_FILE = os.path.join(APP_DIR, "skipped.json")
 MAX_MESSAGE_SIZE = 25 * 1024 * 1024  # 25 MB
 
 
@@ -67,6 +71,219 @@ class ImportState:
             os.remove(STATE_FILE)
         except OSError:
             pass
+
+
+# ---------------------------------------------------------------------------
+# Skipped message tracking
+# ---------------------------------------------------------------------------
+
+class SkippedStore:
+    """Persists skipped message details to skipped.json."""
+
+    @staticmethod
+    def load():
+        if not os.path.exists(SKIPPED_FILE):
+            return None
+        try:
+            with open(SKIPPED_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError):
+            return None
+
+    @staticmethod
+    def save(data):
+        tmp = SKIPPED_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        os.replace(tmp, SKIPPED_FILE)
+
+    @staticmethod
+    def delete():
+        try:
+            os.remove(SKIPPED_FILE)
+        except OSError:
+            pass
+
+    @staticmethod
+    def add_entry(mbox_path, fingerprint, target_folder, entry):
+        """Append a skip entry, creating the file if needed."""
+        data = SkippedStore.load()
+        if data is None or data.get("mbox_fingerprint") != fingerprint:
+            data = {
+                "mbox_path": mbox_path,
+                "mbox_fingerprint": fingerprint,
+                "target_folder": target_folder,
+                "messages": [],
+            }
+        data["messages"].append(entry)
+        SkippedStore.save(data)
+
+
+# ---------------------------------------------------------------------------
+# Retry pipeline — increasingly aggressive fix-up steps
+# ---------------------------------------------------------------------------
+
+_SAFE_HEADERS = ("From", "To", "Cc", "Subject", "Date", "Message-ID",
+                 "In-Reply-To", "References")
+
+
+def _parse_msg(raw_bytes):
+    """Parse raw bytes into an email.message.Message, or None."""
+    try:
+        return email.message_from_bytes(raw_bytes, policy=email.policy.compat32)
+    except Exception:
+        return None
+
+
+def _copy_headers(src, dst):
+    """Copy safe headers from src message to dst message."""
+    for hdr in _SAFE_HEADERS:
+        val = src.get(hdr)
+        if val:
+            dst[hdr] = val
+
+
+def _extract_text(msg):
+    """Pull text/plain (or text/html fallback) from a message."""
+    if msg.is_multipart():
+        for ct in ("text/plain", "text/html"):
+            for part in msg.walk():
+                if part.get_content_type() == ct:
+                    payload = part.get_payload(decode=True)
+                    if payload:
+                        charset = part.get_content_charset("utf-8")
+                        return payload.decode(charset, errors="replace")
+    else:
+        payload = msg.get_payload(decode=True)
+        if payload:
+            charset = msg.get_content_charset("utf-8")
+            return payload.decode(charset, errors="replace")
+    return None
+
+
+# -- Individual retry steps --
+
+def _step_reserialize(raw_bytes):
+    """Step 1: Parse and re-emit. Fixes line folding, boundaries, encoding."""
+    msg = _parse_msg(raw_bytes)
+    if msg is None:
+        return None
+    try:
+        return msg.as_bytes()
+    except Exception:
+        return None
+
+
+def _step_fix_headers(raw_bytes):
+    """Step 2: Fix corrupted sender/recipient/date headers."""
+    msg = _parse_msg(raw_bytes)
+    if msg is None:
+        return None
+    try:
+        changed = False
+        # Fix From
+        from_val = msg.get("From", "")
+        if not from_val or "@" not in from_val:
+            del msg["From"]
+            msg["From"] = "unknown@unknown.com"
+            changed = True
+        # Fix To
+        to_val = msg.get("To", "")
+        if not to_val or "@" not in to_val:
+            del msg["To"]
+            msg["To"] = "unknown@unknown.com"
+            changed = True
+        # Fix Date
+        date_val = msg.get("Date", "")
+        if not date_val or parsedate_tz(date_val) is None:
+            del msg["Date"]
+            msg["Date"] = datetime.now().strftime("%a, %d %b %Y %H:%M:%S %z") or \
+                          "Sat, 01 Jan 2000 00:00:00 +0000"
+            changed = True
+        if not changed:
+            return None  # headers were fine, skip this step
+        return msg.as_bytes()
+    except Exception:
+        return None
+
+
+def _step_strip_attachments(raw_bytes):
+    """Step 3: Keep only text/* parts, remove attachments."""
+    msg = _parse_msg(raw_bytes)
+    if msg is None or not msg.is_multipart():
+        return None
+    try:
+        text_body = _extract_text(msg)
+        if not text_body:
+            return None
+        new_msg = MIMEText(text_body, "plain", "utf-8")
+        _copy_headers(msg, new_msg)
+        new_msg["X-Import-Note"] = "Attachments stripped during import (original was corrupted)"
+        return new_msg.as_bytes()
+    except Exception:
+        return None
+
+
+def _step_flatten_to_text(raw_bytes):
+    """Step 4: Extract whatever text we can into a fresh simple message."""
+    msg = _parse_msg(raw_bytes)
+    if msg is None:
+        return None
+    try:
+        body = _extract_text(msg) or "[Could not extract message body]"
+        new_msg = MIMEText(body, "plain", "utf-8")
+        _copy_headers(msg, new_msg)
+        # Fix headers on the new message too
+        if not new_msg.get("From") or "@" not in new_msg.get("From", ""):
+            del new_msg["From"]
+            new_msg["From"] = "unknown@unknown.com"
+        if not new_msg.get("To") or "@" not in new_msg.get("To", ""):
+            del new_msg["To"]
+            new_msg["To"] = "unknown@unknown.com"
+        new_msg["X-Import-Note"] = "Reconstructed from corrupted original; attachments lost"
+        return new_msg.as_bytes()
+    except Exception:
+        return None
+
+
+def _step_stub_message(raw_bytes):
+    """Step 5: Last resort — headers only, placeholder body."""
+    msg = _parse_msg(raw_bytes)
+    if msg is None:
+        # Can't even parse — build from scratch with minimal info
+        new_msg = MIMEText("[Message body could not be imported]", "plain", "utf-8")
+        new_msg["From"] = "unknown@unknown.com"
+        new_msg["To"] = "unknown@unknown.com"
+        new_msg["Subject"] = "[Corrupted message]"
+        new_msg["Date"] = "Sat, 01 Jan 2000 00:00:00 +0000"
+        new_msg["X-Import-Note"] = "Stub message — original was completely unreadable"
+        try:
+            return new_msg.as_bytes()
+        except Exception:
+            return None
+    try:
+        new_msg = MIMEText("[Message body could not be imported]", "plain", "utf-8")
+        _copy_headers(msg, new_msg)
+        if not new_msg.get("From") or "@" not in new_msg.get("From", ""):
+            del new_msg["From"]
+            new_msg["From"] = "unknown@unknown.com"
+        if not new_msg.get("To") or "@" not in new_msg.get("To", ""):
+            del new_msg["To"]
+            new_msg["To"] = "unknown@unknown.com"
+        new_msg["X-Import-Note"] = "Stub message — original body was corrupted"
+        return new_msg.as_bytes()
+    except Exception:
+        return None
+
+
+# Ordered pipeline: least destructive → most destructive
+RETRY_STEPS = [
+    ("reserialize", _step_reserialize),
+    ("fix_headers", _step_fix_headers),
+    ("strip_attachments", _step_strip_attachments),
+    ("flatten_to_text", _step_flatten_to_text),
+    ("stub_message", _step_stub_message),
+]
 
 
 # ---------------------------------------------------------------------------
@@ -136,6 +353,28 @@ class MboxImporter(threading.Thread):
         except Exception:
             return None
 
+    @staticmethod
+    def _skip_entry(idx, message, reason, detail="", retryable=True):
+        """Build a skip record dict with message metadata."""
+        subject = ""
+        message_id = ""
+        date = ""
+        try:
+            subject = str(message.get("Subject", ""))[:200]
+            message_id = str(message.get("Message-ID", ""))
+            date = str(message.get("Date", ""))
+        except Exception:
+            pass
+        return {
+            "index": idx,
+            "message_id": message_id,
+            "subject": subject,
+            "date": date,
+            "reason": reason,
+            "detail": detail[:500],
+            "retryable": retryable,
+        }
+
     def run(self):
         mbox = mailbox.mbox(self.mbox_path)
         skipped = []
@@ -154,27 +393,50 @@ class MboxImporter(threading.Thread):
                 # Get raw bytes
                 raw = self._message_to_bytes(message)
                 if raw is None:
-                    skipped.append(idx)
+                    entry = self._skip_entry(idx, message, "encoding_failure",
+                                             "Could not serialize message to bytes",
+                                             retryable=False)
+                    skipped.append(entry)
+                    SkippedStore.add_entry(self.mbox_path, fingerprint,
+                                          self.target_folder, entry)
                     self.q.put(("progress", idx, self.total_messages, len(skipped)))
                     continue
 
                 if len(raw) > MAX_MESSAGE_SIZE:
-                    skipped.append(idx)
+                    entry = self._skip_entry(idx, message, "too_large",
+                                             f"Message size {len(raw)} exceeds limit",
+                                             retryable=False)
+                    skipped.append(entry)
+                    SkippedStore.add_entry(self.mbox_path, fingerprint,
+                                          self.target_folder, entry)
                     self.q.put(("progress", idx, self.total_messages, len(skipped)))
                     continue
 
                 flags = self._mbox_flags_to_imap(message)
                 date = self._parse_date(message)
 
-                # Attempt APPEND with one retry on connection failure
+                # Attempt APPEND — skip rejected messages, retry on connection failure
                 try:
                     self.imap.append_message(self.target_folder, flags, date, raw)
+                except MessageRejected as e:
+                    entry = self._skip_entry(idx, message, "rejected", str(e))
+                    skipped.append(entry)
+                    SkippedStore.add_entry(self.mbox_path, fingerprint,
+                                          self.target_folder, entry)
+                    self.q.put(("progress", idx, self.total_messages, len(skipped)))
+                    continue
                 except Exception:
                     try:
                         self.imap.reconnect()
                         self.imap.append_message(self.target_folder, flags, date, raw)
+                    except MessageRejected as e:
+                        entry = self._skip_entry(idx, message, "rejected", str(e))
+                        skipped.append(entry)
+                        SkippedStore.add_entry(self.mbox_path, fingerprint,
+                                              self.target_folder, entry)
+                        self.q.put(("progress", idx, self.total_messages, len(skipped)))
+                        continue
                     except Exception as e:
-                        # Save state and stop
                         self.q.put(("error", f"Connection lost at message {idx + 1}: {e}"))
                         return
 
@@ -203,6 +465,107 @@ class MboxImporter(threading.Thread):
         # Success — clean up state file
         ImportState.delete()
         self.q.put(("done", imported, skipped))
+
+
+# ---------------------------------------------------------------------------
+# Retry thread for skipped messages
+# ---------------------------------------------------------------------------
+
+class SkippedRetryImporter(threading.Thread):
+    """Retries skipped messages using alternative serialization strategies."""
+
+    def __init__(self, imap_client, mbox_path, target_folder, skipped_entries,
+                 msg_queue, cancel_event):
+        super().__init__(daemon=True)
+        self.imap = imap_client
+        self.mbox_path = mbox_path
+        self.target_folder = target_folder
+        self.entries = [e for e in skipped_entries if e.get("retryable", True)]
+        self.q = msg_queue
+        self.cancel_event = cancel_event
+
+    def run(self):
+        mbox = mailbox.mbox(self.mbox_path)
+        recovered = 0
+        still_skipped = []
+        total = len(self.entries)
+
+        for i, entry in enumerate(self.entries):
+            if self.cancel_event.is_set():
+                still_skipped.extend(self.entries[i:])
+                self.q.put(("retry_done", recovered, still_skipped))
+                return
+
+            idx = entry["index"]
+            try:
+                message = mbox[idx]
+            except (KeyError, IndexError):
+                entry["retryable"] = False
+                entry["detail"] = "Message no longer accessible at this index"
+                still_skipped.append(entry)
+                self.q.put(("retry_progress", i + 1, total))
+                continue
+
+            raw = MboxImporter._message_to_bytes(message)
+            if raw is None:
+                entry["retryable"] = False
+                still_skipped.append(entry)
+                self.q.put(("retry_progress", i + 1, total))
+                continue
+
+            flags = MboxImporter._mbox_flags_to_imap(message)
+            date = MboxImporter._parse_date(message)
+
+            # Try each fix-up step from least to most destructive
+            success = False
+            tried_steps = []
+            for step_name, step_fn in RETRY_STEPS:
+                fixed = step_fn(raw)
+                if fixed is None:
+                    continue
+                if len(fixed) > MAX_MESSAGE_SIZE:
+                    continue
+                tried_steps.append(step_name)
+                if self._try_append(fixed, flags, date):
+                    recovered += 1
+                    entry["recovered_by"] = step_name
+                    success = True
+                    break
+
+            if not success:
+                entry["retryable"] = False
+                entry["detail"] = f"All steps failed: {', '.join(tried_steps) or 'none applicable'}"
+                still_skipped.append(entry)
+
+            self.q.put(("retry_progress", i + 1, total))
+            if success:
+                time.sleep(0.5)
+
+        # Update skipped.json
+        if still_skipped:
+            data = SkippedStore.load()
+            if data:
+                data["messages"] = still_skipped
+                SkippedStore.save(data)
+        else:
+            SkippedStore.delete()
+
+        self.q.put(("retry_done", recovered, still_skipped))
+
+    def _try_append(self, message_bytes, flags, date):
+        """Attempt IMAP APPEND with one reconnect retry. Returns True on success."""
+        try:
+            self.imap.append_message(self.target_folder, flags, date, message_bytes)
+            return True
+        except MessageRejected:
+            return False
+        except Exception:
+            try:
+                self.imap.reconnect()
+                self.imap.append_message(self.target_folder, flags, date, message_bytes)
+                return True
+            except Exception:
+                return False
 
 
 # ---------------------------------------------------------------------------
@@ -317,7 +680,10 @@ class App:
         self.import_btn = ttk.Button(btn_row, text="Import", command=self._on_import)
         self.import_btn.pack(side="left", padx=(0, 8))
         self.cancel_btn = ttk.Button(btn_row, text="Cancel", command=self._on_cancel)
-        self.cancel_btn.pack(side="left")
+        self.cancel_btn.pack(side="left", padx=(0, 8))
+        self.retry_btn = ttk.Button(btn_row, text="Retry Skipped (0)",
+                                    command=self._on_retry)
+        self.retry_btn.pack(side="left")
 
         # Resume info label
         self.resume_label = ttk.Label(imp_frame, text="", foreground="blue")
@@ -385,6 +751,34 @@ class App:
         self.folder_combo.configure(state="readonly" if (is_connected or state == "file_loaded") else "disabled")
         self.import_btn.configure(state="normal" if state == "file_loaded" else "disabled")
         self.cancel_btn.configure(state="normal" if is_importing else "disabled")
+        self.retry_btn.configure(state="disabled")
+
+        if state == "file_loaded":
+            self._update_retry_button()
+
+    def _update_retry_button(self):
+        """Enable retry button if there are retryable skipped messages."""
+        if not self.mbox_path:
+            self.retry_btn.configure(text="Retry Skipped (0)", state="disabled")
+            return
+        data = SkippedStore.load()
+        if data is None:
+            self.retry_btn.configure(text="Retry Skipped (0)", state="disabled")
+            return
+        try:
+            fp, _ = ImportState.fingerprint(self.mbox_path)
+        except OSError:
+            self.retry_btn.configure(text="Retry Skipped (0)", state="disabled")
+            return
+        if fp != data.get("mbox_fingerprint"):
+            self.retry_btn.configure(text="Retry Skipped (0)", state="disabled")
+            return
+        retryable = [e for e in data.get("messages", []) if e.get("retryable", True)]
+        count = len(retryable)
+        self.retry_btn.configure(
+            text=f"Retry Skipped ({count})",
+            state="normal" if count > 0 else "disabled",
+        )
 
     # -- connection --
 
@@ -578,6 +972,34 @@ class App:
         self.cancel_event.set()
         self.status_label.configure(text="Cancelling...")
 
+    def _on_retry(self):
+        """Retry skipped messages with alternative strategies."""
+        data = SkippedStore.load()
+        if data is None:
+            return
+
+        self.cancel_event.clear()
+        entries = data.get("messages", [])
+        retryable = [e for e in entries if e.get("retryable", True)]
+
+        self.progress_bar["maximum"] = len(retryable)
+        self.progress_bar["value"] = 0
+        self.progress_label.configure(text=f"0/{len(retryable)}")
+
+        self.importer_thread = SkippedRetryImporter(
+            imap_client=self.imap,
+            mbox_path=self.mbox_path,
+            target_folder=data.get("target_folder", self.folder_var.get()),
+            skipped_entries=entries,
+            msg_queue=self.msg_queue,
+            cancel_event=self.cancel_event,
+        )
+        self.importer_thread.start()
+        self._set_state("importing")
+        self.status_label.configure(text="Retrying skipped messages...")
+        self.skipped_label.configure(text="")
+        self._poll_queue()
+
     def _poll_queue(self):
         """Process messages from the import thread."""
         try:
@@ -591,6 +1013,11 @@ class App:
                     self.progress_label.configure(text=f"{idx + 1}/{total}")
                     if skipped_count:
                         self.skipped_label.configure(text=f"Skipped: {skipped_count}")
+
+                elif kind == "retry_progress":
+                    _, current, total = msg
+                    self.progress_bar["value"] = current
+                    self.progress_label.configure(text=f"{current}/{total}")
 
                 elif kind == "done":
                     _, imported, skipped = msg
@@ -607,6 +1034,21 @@ class App:
                     )
                     self._set_state("file_loaded")
                     self._resume_index = 0
+                    return
+
+                elif kind == "retry_done":
+                    _, recovered, still_skipped = msg
+                    self.status_label.configure(text="Retry complete!")
+                    still_count = len(still_skipped)
+                    detail = ""
+                    if still_count:
+                        detail = (f"\n{still_count} message(s) could not be imported"
+                                  " (corrupted beyond repair).")
+                    messagebox.showinfo(
+                        "Retry Complete",
+                        f"Recovered {recovered} message(s).{detail}",
+                    )
+                    self._set_state("file_loaded")
                     return
 
                 elif kind == "cancelled":
